@@ -1,9 +1,9 @@
 ======================================================================
-REMOVE A SHARD FROM THE LAB SHARDED CLUSTER (MongoDB 9.0)
+REMOVE A SHARD FROM THE LAB SHARDED CLUSTER (MongoDB 8.3 or later)
 Lab built with setup-sharded-lab-en.sh - removing shard3RS
 ======================================================================
 
-Based on: Remove Shards from a Sharded Cluster (MongoDB Manual 9.0)
+Based on: Remove Shards from a Sharded Cluster (MongoDB Manual 8.3+)
 https://www.mongodb.com/docs/manual/tutorial/remove-shards-from-cluster/
 
 ----------------------------------------------------------------------
@@ -43,7 +43,8 @@ shard2RS, then remove shard3RS from the cluster without losing data.
   collection.
 - If you need to remove several shards, start draining all of them
   at the same time instead of one by one. A shard can only take part
-  in one chunk migration at a time.
+  in one chunk migration at a time. Here we remove only one;
+  section 10 shows how it would work with several.
 - Collections stored entirely on the shard are moved with
   moveCollection. Review the moveCollection considerations and
   requirements in the manual before you start.
@@ -193,7 +194,55 @@ Go back to step 4.
   sh.status()
 
 ----------------------------------------------------------------------
-10. CLEAN UP THE LINUX SIDE (LAB)
+10. REFERENCE - REMOVING SEVERAL SHARDS IN PARALLEL (DO NOT RUN)
+----------------------------------------------------------------------
+In this lab we only remove shard3RS, so this section is for
+reference only. It shows how you would remove several shards.
+
+Why in parallel instead of one by one:
+- If you remove one shard at a time, the balancer can move its data
+  onto another shard that you plan to remove later. That data is
+  migrated twice.
+- A shard can only take part in one chunk migration at a time. If
+  you drain several shards together, more migrations run at the
+  same time and the process finishes sooner.
+
+Example: a cluster with 4 shards (shard1RS to shard4RS) where you
+want to remove shard3RS and shard4RS. Collections and databases
+always move to a shard that stays (shard1RS or shard2RS), never to
+another shard that is draining.
+
+1) Start draining every shard before you go on:
+
+  const toRemove = ["shard3RS", "shard4RS"];
+  toRemove.forEach(s => printjson(db.adminCommand({ startShardDraining: s })));
+
+2) Check the status of each one:
+
+  toRemove.forEach(s => {
+    const r = db.adminCommand({ shardDrainingStatus: s });
+    printjson({ shard: s, state: r.state, remaining: r.remaining,
+                dbsToMove: r.dbsToMove, collectionsToMove: r.collectionsToMove });
+  });
+
+3) For each shard, first move what appears in collectionsToMove
+   (moveCollection) and then what appears in dbsToMove
+   (movePrimary), as in steps 4 and 5. The destination is always a
+   shard that stays:
+
+  db.adminCommand({ moveCollection: "<db>.<coll>", toShard: "shard1RS" })
+  db.adminCommand({ movePrimary: "<db>", to: "shard2RS" })
+
+4) When ALL of them show state: "drainingComplete", remove them:
+
+  toRemove.forEach(s => printjson(db.adminCommand({ commitShardRemoval: s })));
+
+5) Check with listShards that only shard1RS and shard2RS remain, and
+   clean up the Linux services of each removed shard, as in
+   section 11.
+
+----------------------------------------------------------------------
+11. CLEAN UP THE LINUX SIDE (LAB)
 ----------------------------------------------------------------------
 The shard3RS processes keep running until you stop them. They are no
 longer part of the cluster.
@@ -221,7 +270,7 @@ Notes about the lab script:
 - "reset" still removes everything correctly.
 
 ----------------------------------------------------------------------
-11. OPTIONAL - ADD shard3RS BACK (RETURN TO 3 SHARDS)
+12. OPTIONAL - ADD shard3RS BACK (RETURN TO 3 SHARDS)
 ----------------------------------------------------------------------
 Use this to repeat the exercise in class. Start with an empty data
 directory. The example uses 1 member (port 27401).
@@ -266,7 +315,7 @@ three units, and use the three hosts (27401, 27402, 27403) in
 rs.initiate() and sh.addShard().
 
 ----------------------------------------------------------------------
-12. QUICK TROUBLESHOOTING
+13. QUICK TROUBLESHOOTING
 ----------------------------------------------------------------------
 - remaining.chunks does not go down
     The balancer is off -> sh.getBalancerState() / sh.startBalancer().

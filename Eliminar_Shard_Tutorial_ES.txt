@@ -1,9 +1,9 @@
 ======================================================================
-ELIMINAR UN SHARD DEL SHARDED CLUSTER DE LABORATORIO (MongoDB 9.0)
+ELIMINAR UN SHARD DEL SHARDED CLUSTER DE LABORATORIO (MongoDB 8.3 o posterior)
 Laboratorio creado con setup-sharded-lab.sh - eliminando shard3RS
 ======================================================================
 
-Basado en: Remove Shards from a Sharded Cluster (MongoDB Manual 9.0)
+Basado en: Remove Shards from a Sharded Cluster (MongoDB Manual 8.3+)
 https://www.mongodb.com/docs/manual/tutorial/remove-shards-from-cluster/
 
 ----------------------------------------------------------------------
@@ -43,7 +43,8 @@ y luego quitar shard3RS del clúster sin perder datos.
 - MongoDB guarda el estado del drenado en la colección config.shards.
 - Si vas a quitar varios shards, drénalos todos al mismo tiempo en
   lugar de uno por uno. Un shard solo puede participar en una
-  migración de chunks a la vez.
+  migración de chunks a la vez. Aquí solo quitamos uno; la
+  sección 10 muestra cómo sería con varios.
 - Las colecciones que viven completas en el shard se mueven con
   moveCollection. Antes de empezar, revisa en el manual las
   consideraciones y requisitos de moveCollection.
@@ -196,7 +197,56 @@ error. Regresa al paso 4.
   sh.status()
 
 ----------------------------------------------------------------------
-10. LIMPIAR EL LADO DE LINUX (LABORATORIO)
+10. REFERENCIA - QUITAR VARIOS SHARDS EN PARALELO (NO LO EJECUTES)
+----------------------------------------------------------------------
+En este laboratorio solo quitamos shard3RS, así que esta sección es
+solo de referencia. Muestra cómo sería si tuvieras que quitar varios
+shards.
+
+Por qué en paralelo y no uno por uno:
+- Si quitas un shard a la vez, el balancer puede mover sus datos a
+  otro shard que también vas a quitar después. Esos datos se
+  migran dos veces.
+- Un shard solo puede participar en una migración de chunks a la
+  vez. Si drenas varios shards juntos, corren más migraciones al
+  mismo tiempo y el proceso termina antes.
+
+Ejemplo: un clúster con 4 shards (shard1RS a shard4RS) en el que
+quieres quitar shard3RS y shard4RS. Las colecciones y las bases de
+datos siempre se mueven a un shard que se queda (shard1RS o
+shard2RS), nunca a otro shard que se está drenando.
+
+1) Inicia el drenado de todos los shards antes de seguir:
+
+  const quitar = ["shard3RS", "shard4RS"];
+  quitar.forEach(s => printjson(db.adminCommand({ startShardDraining: s })));
+
+2) Revisa el estado de cada uno:
+
+  quitar.forEach(s => {
+    const r = db.adminCommand({ shardDrainingStatus: s });
+    printjson({ shard: s, state: r.state, remaining: r.remaining,
+                dbsToMove: r.dbsToMove, collectionsToMove: r.collectionsToMove });
+  });
+
+3) En cada shard, mueve primero lo que salga en collectionsToMove
+   (moveCollection) y después lo de dbsToMove (movePrimary), igual
+   que en los pasos 4 y 5. El destino siempre es un shard que se
+   queda:
+
+  db.adminCommand({ moveCollection: "<db>.<coleccion>", toShard: "shard1RS" })
+  db.adminCommand({ movePrimary: "<db>", to: "shard2RS" })
+
+4) Cuando TODOS digan state: "drainingComplete", quítalos:
+
+  quitar.forEach(s => printjson(db.adminCommand({ commitShardRemoval: s })));
+
+5) Verifica con listShards que solo queden shard1RS y shard2RS, y
+   limpia en Linux los servicios de cada shard eliminado, como en
+   la sección 11.
+
+----------------------------------------------------------------------
+11. LIMPIAR EL LADO DE LINUX (LABORATORIO)
 ----------------------------------------------------------------------
 Los procesos de shard3RS siguen corriendo hasta que los detengas. Ya
 no forman parte del clúster.
@@ -224,7 +274,7 @@ Notas sobre el script del laboratorio:
 - "reset" sigue borrando todo correctamente.
 
 ----------------------------------------------------------------------
-11. OPCIONAL - VOLVER A AGREGAR shard3RS (REGRESAR A 3 SHARDS)
+12. OPCIONAL - VOLVER A AGREGAR shard3RS (REGRESAR A 3 SHARDS)
 ----------------------------------------------------------------------
 Sirve para repetir el ejercicio en clase. Empieza con el directorio
 de datos vacío. El ejemplo usa 1 miembro (puerto 27401).
@@ -269,7 +319,7 @@ tres unidades y usa los tres hosts (27401, 27402, 27403) en
 rs.initiate() y sh.addShard().
 
 ----------------------------------------------------------------------
-12. SOLUCIÓN RÁPIDA DE PROBLEMAS
+13. SOLUCIÓN RÁPIDA DE PROBLEMAS
 ----------------------------------------------------------------------
 - remaining.chunks no baja
     El balancer está apagado -> sh.getBalancerState() / sh.startBalancer().
