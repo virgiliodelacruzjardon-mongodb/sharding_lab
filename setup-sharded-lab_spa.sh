@@ -2,7 +2,8 @@
 # =============================================================================
 # setup-sharded-lab.sh
 # Laboratorio: sharded cluster MongoDB 9.0 con 3 shards en UN solo servidor
-# Ubuntu 24.04 / 22.04 / 26.04 LTS · keyfile · systemd · hosts como localhost
+# Ubuntu 24.04 / 22.04 / 26.04 LTS o Debian 13 (x86_64) · keyfile · systemd
+# Todos los hosts como localhost
 #
 # Uso:
 #   sudo bash setup-sharded-lab.sh           # instala y configura todo
@@ -146,20 +147,36 @@ packages() { # paquetes de la edición, con versión si MONGO_VERSION está defi
   echo mongodb-mongosh
 }
 
-install_packages() {
+check_os() { # define DISTRO, CODE, COMP, ARCHS; se detiene si 9.0 no tiene paquetes aquí
   . /etc/os-release
-  local code=${VERSION_CODENAME:-} arch host path list f
-  case $code in
-    noble|jammy|resolute) ;;
-    *) die "MongoDB $TARGET_SERIES se instala aquí solo en Ubuntu 24.04, 22.04 o 26.04 (detectado: ${PRETTY_NAME:-desconocido})." ;;
-  esac
+  local os=${ID:-} arch
+  CODE=${VERSION_CODENAME:-}
   arch=$(dpkg --print-architecture)
-  [[ $arch == amd64 || $arch == arm64 ]] || die "Arquitectura no soportada: $arch"
+  case "$os/$CODE" in
+    ubuntu/noble|ubuntu/jammy|ubuntu/resolute)
+      DISTRO=ubuntu; COMP=multiverse; ARCHS=amd64,arm64
+      [[ $arch == amd64 || $arch == arm64 ]] || die "Arquitectura no soportada: $arch" ;;
+    debian/trixie)
+      DISTRO=debian; COMP=main; ARCHS=amd64
+      [[ $arch == amd64 ]] || die "MongoDB $TARGET_SERIES en Debian solo tiene paquetes para x86_64 (amd64); detectado: $arch" ;;
+    debian/bookworm)
+      die "MongoDB $TARGET_SERIES no tiene paquetes para Debian 12 (bookworm); en Debian solo soporta Debian 13 (trixie).
+        Opciones: 1) actualizar este servidor a Debian 13,  2) usar Ubuntu 24.04,
+        3) quedarte en Debian 12 con MongoDB 8.0. No se cambió nada en el sistema." ;;
+    *)
+      die "MongoDB $TARGET_SERIES se instala aquí solo en Ubuntu 24.04/22.04/26.04 o Debian 13 (detectado: ${PRETTY_NAME:-desconocido})." ;;
+  esac
+  info "Sistema: ${PRETTY_NAME:-desconocido} ($arch) -> repositorio $DISTRO $CODE"
+}
+
+install_packages() {
+  check_os
+  local host path list f
   if [[ $EDITION == enterprise ]]; then host=repo.mongodb.com; path=mongodb-enterprise
   else host=repo.mongodb.org; path=mongodb-org; fi
   list=/etc/apt/sources.list.d/$path-$TARGET_SERIES.list
 
-  log "Configurando el repositorio oficial de MongoDB $EDITION $TARGET_SERIES ($code)"
+  log "Configurando el repositorio oficial de MongoDB $EDITION $TARGET_SERIES ($DISTRO $CODE)"
   for f in /etc/apt/sources.list.d/mongodb-org-*.list /etc/apt/sources.list.d/mongodb-enterprise-*.list; do
     [[ -e $f && $f != "$list" ]] || continue
     mv "$f" "$f.disabled"; info "repositorio anterior desactivado: $f"
@@ -167,7 +184,7 @@ install_packages() {
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg curl ca-certificates
   curl -fsSL https://pgp.mongodb.com/server-9.asc | gpg --dearmor --yes -o "$KEYRING"
-  echo "deb [ arch=amd64,arm64 signed-by=$KEYRING ] https://$host/apt/ubuntu $code/$path/$TARGET_SERIES multiverse" > "$list"
+  echo "deb [ arch=$ARCHS signed-by=$KEYRING ] https://$host/apt/$DISTRO $CODE/$path/$TARGET_SERIES $COMP" > "$list"
   apt-get update -qq
 
   log "Instalando paquetes de MongoDB $EDITION ${MONGO_VERSION:-$TARGET_SERIES (última)}"
@@ -207,8 +224,7 @@ choose_topology() {
 
 preflight() {
   log "Verificando el sistema"
-  . /etc/os-release
-  info "Sistema: ${PRETTY_NAME:-desconocido}"
+  check_os
   if [[ -d $DATA_DIR/cfg-a && -n $(ls -A "$DATA_DIR/cfg-a" 2>/dev/null) ]]; then
     die "Ya existe un laboratorio en $DATA_DIR. Para subirlo a $TARGET_SERIES: sudo bash $0 upgrade · Para empezar de cero: sudo bash $0 reset"
   fi
@@ -494,9 +510,11 @@ cmd_upgrade() { # 8.0 / 8.3 -> 9.0, siguiendo el orden de la guía oficial
   case $mm in
     "$TARGET_SERIES") info "Los binarios ya son $TARGET_SERIES; solo se revisa el FCV." ;;
     8.0|8.3) ;;
+    8.1|8.2) die "A $TARGET_SERIES no se sube desde $mm: primero hay que pasar por 8.3 (binarios y FCV 8.3) y luego a $TARGET_SERIES. En un laboratorio es más rápido recrearlo: sudo bash $0 reset && sudo bash $0" ;;
     *) die "A $TARGET_SERIES solo se sube desde 8.0 u 8.3 (tienes ${ver:-nada}). Sube primero a 8.0, o recrea el laboratorio: sudo bash $0 reset && sudo bash $0" ;;
   esac
 
+  [[ $mm == "$TARGET_SERIES" ]] || check_os   # antes de tocar FCV, balancer o servicios
   ask_existing_pwd ADMIN_PWD "$ADMIN_USER"
   export ADMIN_PWD
   start_ordered
