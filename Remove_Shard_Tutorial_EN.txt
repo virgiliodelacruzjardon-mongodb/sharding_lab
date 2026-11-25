@@ -1,0 +1,294 @@
+======================================================================
+REMOVE A SHARD FROM THE LAB SHARDED CLUSTER (MongoDB 9.0)
+Lab built with setup-sharded-lab-en.sh - removing shard3RS
+======================================================================
+
+Based on: Remove Shards from a Sharded Cluster (MongoDB Manual 9.0)
+https://www.mongodb.com/docs/manual/tutorial/remove-shards-from-cluster/
+
+----------------------------------------------------------------------
+0. LAB CONTEXT
+----------------------------------------------------------------------
+Cluster created by the script:
+
+  Router (mongos) .... localhost:27017
+  Config servers ..... cfgRS     (27101-27103)
+  Shard 1 ............ shard1RS  (27201-27203)
+  Shard 2 ............ shard2RS  (27301-27303)
+  Shard 3 ............ shard3RS  (27401-27403)   <-- the shard we remove
+  Admin user ......... clusterAdmin
+  Test collection .... labdb.customers (shard key { _id: "hashed" })
+
+With less than 15 GB of RAM the script uses 1 member per replica set,
+so shard3RS only has sh3-a (port 27401). With 3 members it also has
+sh3-b and sh3-c.
+
+Goal: move every piece of data off shard3RS onto shard1RS and
+shard2RS, then remove shard3RS from the cluster without losing data.
+
+----------------------------------------------------------------------
+1. WHAT TO KNOW BEFORE YOU START
+----------------------------------------------------------------------
+- You must migrate the shard's data to the remaining shards before
+  removing it.
+- Do not create, shard, or move collections while you run this
+  procedure. It can cause interruptions and unexpected results.
+- Do not use this procedure to migrate a whole cluster to new
+  hardware. There is a separate procedure for that.
+- Removing a shard can close open change stream cursors, and they
+  may not be fully resumable.
+- You can safely restart the cluster during the removal. Draining
+  continues automatically after the components restart.
+- MongoDB records the draining status in the config.shards
+  collection.
+- If you need to remove several shards, start draining all of them
+  at the same time instead of one by one. A shard can only take part
+  in one chunk migration at a time.
+- Collections stored entirely on the shard are moved with
+  moveCollection. Review the moveCollection considerations and
+  requirements in the manual before you start.
+
+----------------------------------------------------------------------
+2. CONNECT TO THE MONGOS AND CHECK THE STARTING STATE
+----------------------------------------------------------------------
+Always work through the mongos (port 27017), never directly on a
+shard.
+
+  mongosh --port 27017 -u clusterAdmin -p --authenticationDatabase admin
+
+Note how the data is distributed now, so you can compare later:
+
+  use labdb
+  db.customers.countDocuments()          // expected: 30000
+  db.customers.getShardDistribution()    // about 33% on each shard
+  sh.status()
+
+----------------------------------------------------------------------
+3. STEP 1 - MAKE SURE THE BALANCER IS ENABLED
+----------------------------------------------------------------------
+The balancer moves the chunks off the shard, so it must be enabled.
+
+  sh.getBalancerState()
+
+  true  -> enabled, continue.
+  false -> enable it:
+
+  sh.startBalancer()
+  sh.getBalancerState()                  // must return true
+
+----------------------------------------------------------------------
+4. STEP 2 - CONFIRM THE NAME OF THE SHARD
+----------------------------------------------------------------------
+  db.adminCommand({ listShards: 1 }).shards.map(s => s._id + "  " + s.host)
+
+The shards._id field is the shard name. In this lab it is:
+
+  shard3RS
+
+----------------------------------------------------------------------
+5. STEP 3 - START DRAINING THE SHARD
+----------------------------------------------------------------------
+This starts moving chunks of the sharded collections (for example
+labdb.customers) from shard3RS to the other shards:
+
+  db.adminCommand({ startShardDraining: "shard3RS" })
+
+----------------------------------------------------------------------
+6. STEP 4 - CHECK THE STATUS AND MOVE UNSHARDED COLLECTIONS
+----------------------------------------------------------------------
+Check the draining status:
+
+  db.adminCommand({ shardDrainingStatus: "shard3RS" })
+
+Typical output while it is still running:
+
+  {
+    msg: "draining ongoing",
+    state: "ongoing",
+    remaining: { chunks: ..., dbs: ..., jumboChunks: ..., collectionsToMove: ... },
+    shard: "shard3RS",
+    note: "you need to call moveCollection for collectionsToMove and
+           afterwards movePrimary for the dbsToMove",
+    dbsToMove: [ ... ],
+    collectionsToMove: [ ... ],
+    ok: 1
+  }
+
+What to look at:
+- remaining.chunks: chunks the balancer still has to migrate. It
+  drops on its own.
+- collectionsToMove: collections stored entirely on shard3RS
+  (unsharded collections, or collections of a database whose primary
+  shard is shard3RS). The balancer does NOT move these. You must move
+  each one yourself.
+- dbsToMove: databases whose primary shard is shard3RS. See step 5.
+
+If collectionsToMove is not empty, move each collection. Example:
+
+  db.adminCommand({
+    moveCollection: "labdb.mycollection",
+    toShard: "shard1RS"
+  })
+
+In a lab built only with the script, collectionsToMove is usually
+empty, because labdb.customers is sharded. If you created extra
+collections without sharding them (for example in the shard key
+exercises), they can appear here.
+
+Optional - watch the draining until it finishes (stop with Ctrl+C):
+
+  while (true) {
+    const s = db.adminCommand({ shardDrainingStatus: "shard3RS" });
+    printjson({ state: s.state, remaining: s.remaining,
+                dbsToMove: s.dbsToMove, collectionsToMove: s.collectionsToMove });
+    if (s.state === "drainingComplete") break;
+    sleep(5000);
+  }
+
+----------------------------------------------------------------------
+7. STEP 5 - MOVE PRIMARY SHARDS (dbsToMove)
+----------------------------------------------------------------------
+Each database has a primary shard. If shard3RS is the primary shard
+of a database, that database appears in dbsToMove.
+
+Do this AFTER collectionsToMove is empty, as the status note says.
+
+  db.adminCommand({ shardDrainingStatus: "shard3RS" }).dbsToMove
+
+For each database in the list, for example labdb:
+
+  db.adminCommand({ movePrimary: "labdb", to: "shard1RS" })
+
+Whether labdb appears here depends on which shard MongoDB picked as
+its primary when it was created. You can check it with:
+
+  db.getSiblingDB("config").databases.find({}, { primary: 1 })
+
+----------------------------------------------------------------------
+8. STEP 6 - CONFIRM DRAINING IS COMPLETE AND REMOVE THE SHARD
+----------------------------------------------------------------------
+  db.adminCommand({ shardDrainingStatus: "shard3RS" })
+
+Wait until you see:
+
+  { msg: "draining completed successfully", state: "drainingComplete", ok: 1 }
+
+Then remove the shard:
+
+  db.adminCommand({ commitShardRemoval: "shard3RS" })
+
+Expected result: { ok: 1, ... }
+If the shard is not fully drained, the command returns an error.
+Go back to step 4.
+
+----------------------------------------------------------------------
+9. VERIFY THE RESULT
+----------------------------------------------------------------------
+  db.adminCommand({ listShards: 1 }).shards.map(s => s._id)
+  // expected: [ 'shard1RS', 'shard2RS' ]
+
+  use labdb
+  db.customers.countDocuments()          // must still be 30000
+  db.customers.getShardDistribution()    // now only shard1RS and shard2RS
+  sh.status()
+
+----------------------------------------------------------------------
+10. CLEAN UP THE LINUX SIDE (LAB)
+----------------------------------------------------------------------
+The shard3RS processes keep running until you stop them. They are no
+longer part of the cluster.
+
+Run these in the Linux terminal, not in mongosh.
+
+1 member per replica set (your 7 GB lab):
+
+  sudo systemctl disable --now mongod-lab@sh3-a
+
+3 members per replica set:
+
+  sudo systemctl disable --now mongod-lab@sh3-a mongod-lab@sh3-b mongod-lab@sh3-c
+
+Optional - delete the data of the removed shard (DESTRUCTIVE):
+
+  sudo rm -rf /data/mongo/sh3-*
+
+Notes about the lab script:
+- "status" still lists sh3-* and will show them as inactive. This is
+  expected.
+- "start" still starts sh3-*, because the script always expects
+  3 shards. The process runs on its own and the cluster does not use
+  it. Stop it again with the systemctl command above.
+- "reset" still removes everything correctly.
+
+----------------------------------------------------------------------
+11. OPTIONAL - ADD shard3RS BACK (RETURN TO 3 SHARDS)
+----------------------------------------------------------------------
+Use this to repeat the exercise in class. Start with an empty data
+directory. The example uses 1 member (port 27401).
+
+In the Linux terminal:
+
+  sudo systemctl stop mongod-lab@sh3-a
+  sudo rm -rf /data/mongo/sh3-a/*
+  sudo systemctl enable --now mongod-lab@sh3-a
+
+Initialize the replica set (there are no users yet, so the localhost
+exception lets you connect without credentials):
+
+  mongosh --port 27401 --eval '
+    rs.initiate({ _id: "shard3RS", members: [ { _id: 0, host: "localhost:27401" } ] })'
+
+Optional - create the shard-local administrator again:
+
+  mongosh "mongodb://localhost:27401/admin?replicaSet=shard3RS"
+
+Then run:
+
+  db.getSiblingDB("admin").createUser({
+    user: "shardAdmin",
+    pwd: passwordPrompt(),
+    roles: [ { role: "userAdminAnyDatabase", db: "admin" },
+             { role: "clusterAdmin", db: "admin" } ]
+  })
+  exit
+
+From the mongos, as clusterAdmin:
+
+  sh.addShard("shard3RS/localhost:27401")
+  db.adminCommand({ listShards: 1 }).shards.map(s => s._id)
+
+The balancer only moves data back to shard3RS when the difference
+between shards reaches its migration threshold. With the small lab
+data set, labdb.customers may stay on shard1RS and shard2RS.
+
+With 3 members: wipe /data/mongo/sh3-a, sh3-b and sh3-c, start all
+three units, and use the three hosts (27401, 27402, 27403) in
+rs.initiate() and sh.addShard().
+
+----------------------------------------------------------------------
+12. QUICK TROUBLESHOOTING
+----------------------------------------------------------------------
+- remaining.chunks does not go down
+    The balancer is off -> sh.getBalancerState() / sh.startBalancer().
+- jumboChunks > 0
+    Some chunks are too big to migrate. See "Clear jumbo Flag" in the
+    manual.
+- collectionsToMove is not empty
+    The balancer does not move them. Run moveCollection for each one.
+- dbsToMove is not empty
+    Run movePrimary for each database.
+- commitShardRemoval returns an error
+    The shard is not fully drained. Check shardDrainingStatus again.
+- Unauthorized
+    Connect with -u clusterAdmin -p --authenticationDatabase admin.
+
+----------------------------------------------------------------------
+COMMAND SUMMARY (run from the mongos)
+----------------------------------------------------------------------
+  sh.getBalancerState()
+  db.adminCommand({ listShards: 1 })
+  db.adminCommand({ startShardDraining: "shard3RS" })
+  db.adminCommand({ shardDrainingStatus: "shard3RS" })
+  db.adminCommand({ moveCollection: "<db>.<coll>", toShard: "shard1RS" })
+  db.adminCommand({ movePrimary: "<db>", to: "shard1RS" })
+  db.adminCommand({ commitShardRemoval: "shard3RS" })
