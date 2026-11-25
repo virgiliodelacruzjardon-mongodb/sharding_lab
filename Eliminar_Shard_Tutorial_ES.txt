@@ -44,7 +44,7 @@ y luego quitar shard3RS del clúster sin perder datos.
 - Si vas a quitar varios shards, drénalos todos al mismo tiempo en
   lugar de uno por uno. Un shard solo puede participar en una
   migración de chunks a la vez. Aquí solo quitamos uno; la
-  sección 10 muestra cómo sería con varios.
+  sección 12 muestra cómo sería con varios.
 - Las colecciones que viven completas en el shard se mueven con
   moveCollection. Antes de empezar, revisa en el manual las
   consideraciones y requisitos de moveCollection.
@@ -197,7 +197,151 @@ error. Regresa al paso 4.
   sh.status()
 
 ----------------------------------------------------------------------
-10. REFERENCIA - QUITAR VARIOS SHARDS EN PARALELO (NO LO EJECUTES)
+10. PASO 7 (OPCIONAL) - REDISTRIBUIR LOS DATOS CON reshardCollection
+----------------------------------------------------------------------
+Después de quitar shard3RS, los chunks que salieron de ese shard se
+quedan donde los dejó el balancer. Para repartir labdb.clientes de
+forma pareja entre los shards que quedan, reescribe la colección con
+la misma shard key usando forceRedistribution.
+
+Antes de empezar:
+- Solo se puede hacer resharding de una colección a la vez.
+- Necesitas espacio libre en disco de aproximadamente el doble del
+  tamaño de la colección.
+- Un resharding tarda COMO MÍNIMO 5 minutos, aunque la colección sea
+  pequeña. Con 30000 documentos es normal que tarde unos 5-6 minutos.
+- mongosh no muestra nada mientras el comando corre. Por eso el
+  avance se sigue desde una segunda terminal (paso 8).
+
+10.1 Apagar el balancer (terminal 1, conectada al mongos):
+
+  sh.stopBalancer()
+  sh.getBalancerState()                  // debe devolver false
+
+10.2 Ejecutar el resharding (terminal 1):
+
+  db.adminCommand({
+    reshardCollection: "labdb.clientes",
+    key: { _id: "hashed" },
+    forceRedistribution: true
+  })
+
+El comando se queda esperando hasta que termina. NO cierres esta
+terminal. Resultado esperado al final: { ok: 1, ... }
+
+Para cancelarlo (la colección se queda como estaba antes):
+
+  sh.abortReshardCollection("labdb.clientes")
+
+----------------------------------------------------------------------
+11. PASO 8 - SEGUIR EL AVANCE CON EL SCRIPT progreso_reshard.js
+----------------------------------------------------------------------
+El script consulta $currentOp cada 10 segundos. Para cada shard que
+recibe datos (recipient) muestra el porcentaje de documentos
+copiados, el porcentaje de tiempo, cuánto lleva y cuánto falta. Se
+detiene solo cuando termina el resharding.
+
+11.1 Crear el script (terminal 2, en Linux, no en mongosh).
+     Copia desde la línea "cat" hasta la línea "EOF", incluida:
+
+cat > ~/progreso_reshard.js <<'EOF'
+const NS = "labdb.clientes";
+const INTERVAL_MS = 10000;   // refresh every 10 s
+
+function num(x) {
+  if (x === undefined || x === null) return null;
+  return typeof x.toNumber === "function" ? x.toNumber() : Number(x);
+}
+
+function bar(pct, width = 30) {
+  const p = Math.max(0, Math.min(100, pct));
+  const full = Math.round((p / 100) * width);
+  return "[" + "#".repeat(full) + "-".repeat(width - full) + "] " + p.toFixed(1).padStart(5) + "%";
+}
+
+function fmt(sec) {
+  if (sec === null || sec < 0) return "calculando...";
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `~${m}m ${String(s).padStart(2, "0")}s`;
+}
+
+while (true) {
+  const ops = db.getSiblingDB("admin").aggregate([
+    { $currentOp: { allUsers: true, localOps: false } },
+    { $match: { type: "op", "originatingCommand.reshardCollection": NS } }
+  ]).toArray();
+
+  if (ops.length === 0) {
+    print(`\n[OK] Ya no hay resharding activo para ${NS}. Terminó (o no ha iniciado).`);
+    break;
+  }
+
+  print(`\n=== Resharding ${NS} - ${new Date().toLocaleTimeString()} ===`);
+
+  ops.filter(o => (o.desc || "").includes("Recipient")).forEach(o => {
+    const elapsed  = num(o.totalOperationTimeElapsedSecs) ?? 0;
+    const left     = num(o.remainingOperationTimeEstimatedSecs);
+    const docsTot  = num(o.approxDocumentsToCopy) ?? 0;
+    const docsCop  = num(o.documentsCopied) ?? 0;
+    const pctDocs  = docsTot > 0 ? (docsCop / docsTot) * 100 : 0;
+    const pctTime  = (left !== null && left >= 0) ? (elapsed / (elapsed + left)) * 100 : 0;
+
+    print(`\n${o.shard}   estado: ${o.recipientState ?? "n/d"}`);
+    print(`  Documentos ${bar(pctDocs)}  (${docsCop} / ${docsTot})`);
+    print(`  Tiempo     ${bar(pctTime)}  lleva ${fmt(elapsed).replace("~", "")} | faltan ${fmt(left)}`);
+  });
+
+  const c = ops.find(o => (o.desc || "").includes("Coordinator"));
+  if (c) print(`\nCoordinador: ${c.coordinatorState ?? "n/d"}`);
+
+  sleep(INTERVAL_MS);
+}
+EOF
+
+11.2 Ejecutar el script (terminal 2):
+
+  mongosh --port 27017 -u clusterAdmin -p --authenticationDatabase admin --file ~/progreso_reshard.js
+
+  O, si ya estás dentro de mongosh:
+
+  load("/home/<tu_usuario>/progreso_reshard.js")
+
+  Para detenerlo antes de que termine: Ctrl+C.
+
+11.3 Cómo leer la salida. Ejemplo:
+
+  === Resharding labdb.clientes - 10:42:15 ===
+
+  shard2RS   estado: applying
+    Documentos [##############################] 100.0%  (15012 / 15000)
+    Tiempo     [###############---------------]  50.7%  lleva 4m 02s | faltan ~3m 55s
+
+- Cada shard aparece en $currentOp dos veces, como donor y como
+  recipient. Con forceRedistribution cada shard envía y recibe
+  datos. El script solo muestra los recipients, porque ahí están los
+  contadores de documentos.
+- Documentos: documentsCopied / approxDocumentsToCopy. El total es un
+  estimado, así que puede pasar un poco del 100%.
+- Tiempo: lleva / (lleva + falta). Al inicio el tiempo restante vale
+  -1 y el script muestra "calculando...". La estimación suele ser
+  mayor que el tiempo real.
+- Con 30000 documentos la copia llega al 100% casi enseguida y el
+  estado pasa de cloning a applying. La operación sigue hasta cumplir
+  el mínimo de 5 minutos, así que la barra de Tiempo es la que mejor
+  indica cuánto falta.
+
+11.4 Cuando termine (el script imprime [OK] y la terminal 1 muestra
+     { ok: 1 }), vuelve a encender el balancer y verifica:
+
+  sh.startBalancer()
+  sh.getBalancerState()                  // debe devolver true
+
+  use labdb
+  db.clientes.countDocuments()           // debe seguir en 30000
+  db.clientes.getShardDistribution()     // ~50% en shard1RS y ~50% en shard2RS
+
+----------------------------------------------------------------------
+12. REFERENCIA - QUITAR VARIOS SHARDS EN PARALELO (NO LO EJECUTES)
 ----------------------------------------------------------------------
 En este laboratorio solo quitamos shard3RS, así que esta sección es
 solo de referencia. Muestra cómo sería si tuvieras que quitar varios
@@ -243,10 +387,10 @@ shard2RS), nunca a otro shard que se está drenando.
 
 5) Verifica con listShards que solo queden shard1RS y shard2RS, y
    limpia en Linux los servicios de cada shard eliminado, como en
-   la sección 11.
+   la sección 13.
 
 ----------------------------------------------------------------------
-11. LIMPIAR EL LADO DE LINUX (LABORATORIO)
+13. LIMPIAR EL LADO DE LINUX (LABORATORIO)
 ----------------------------------------------------------------------
 Los procesos de shard3RS siguen corriendo hasta que los detengas. Ya
 no forman parte del clúster.
@@ -274,7 +418,7 @@ Notas sobre el script del laboratorio:
 - "reset" sigue borrando todo correctamente.
 
 ----------------------------------------------------------------------
-12. OPCIONAL - VOLVER A AGREGAR shard3RS (REGRESAR A 3 SHARDS)
+14. OPCIONAL - VOLVER A AGREGAR shard3RS (REGRESAR A 3 SHARDS)
 ----------------------------------------------------------------------
 Sirve para repetir el ejercicio en clase. Empieza con el directorio
 de datos vacío. El ejemplo usa 1 miembro (puerto 27401).
@@ -313,13 +457,15 @@ Desde el mongos, como clusterAdmin:
 El balancer solo regresa datos a shard3RS cuando la diferencia entre
 shards llega a su umbral de migración. Con los pocos datos del
 laboratorio, labdb.clientes puede quedarse en shard1RS y shard2RS.
+Para repartirla de inmediato en los 3 shards, repite los pasos 7
+y 8 (secciones 10 y 11). Esperado: ~33% en cada shard.
 
 Con 3 miembros: vacía /data/mongo/sh3-a, sh3-b y sh3-c, arranca las
 tres unidades y usa los tres hosts (27401, 27402, 27403) en
 rs.initiate() y sh.addShard().
 
 ----------------------------------------------------------------------
-13. SOLUCIÓN RÁPIDA DE PROBLEMAS
+15. SOLUCIÓN RÁPIDA DE PROBLEMAS
 ----------------------------------------------------------------------
 - remaining.chunks no baja
     El balancer está apagado -> sh.getBalancerState() / sh.startBalancer().
@@ -334,6 +480,13 @@ rs.initiate() y sh.addShard().
     El shard no está drenado por completo. Revisa shardDrainingStatus.
 - Unauthorized
     Conéctate con -u clusterAdmin -p --authenticationDatabase admin.
+- reshardCollection parece congelado
+    Es normal: tarda mínimo 5 minutos. Sigue el avance con
+    progreso_reshard.js (sección 11). Para cancelar:
+    sh.abortReshardCollection("labdb.clientes").
+- El script dice [OK] pero nunca mostró avance
+    El resharding no había iniciado o ya había terminado. Revisa
+    que el NS del script sea "labdb.clientes".
 
 ----------------------------------------------------------------------
 RESUMEN DE COMANDOS (desde el mongos)
@@ -345,3 +498,7 @@ RESUMEN DE COMANDOS (desde el mongos)
   db.adminCommand({ moveCollection: "<db>.<coleccion>", toShard: "shard1RS" })
   db.adminCommand({ movePrimary: "<db>", to: "shard1RS" })
   db.adminCommand({ commitShardRemoval: "shard3RS" })
+  sh.stopBalancer()
+  db.adminCommand({ reshardCollection: "labdb.clientes", key: { _id: "hashed" }, forceRedistribution: true })
+  sh.abortReshardCollection("labdb.clientes")
+  sh.startBalancer()
