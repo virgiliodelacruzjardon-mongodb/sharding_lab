@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # setup-sharded-lab.sh
-# Laboratorio: sharded cluster MongoDB 9.0 con 3 shards en UN solo servidor
-# Ubuntu 24.04 / 22.04 / 26.04 LTS o Debian 13 (x86_64) · keyfile · systemd
+# Laboratorio: sharded cluster MongoDB 8.3 con 3 shards en UN solo servidor
+# Debian 12 (x86_64) o Ubuntu 24.04 / 22.04 / 20.04 LTS · keyfile · systemd
 # Todos los hosts como localhost
 #
 # Uso:
 #   sudo bash setup-sharded-lab.sh           # instala y configura todo
-#   sudo bash setup-sharded-lab.sh upgrade   # sube un laboratorio 8.0/8.3 a 9.0
+#   sudo bash setup-sharded-lab.sh upgrade   # sube un laboratorio 8.0/8.2 a 8.3
 #   sudo bash setup-sharded-lab.sh status    # estado y versión de cada proceso
 #   sudo bash setup-sharded-lab.sh stop      # apaga en orden
 #   sudo bash setup-sharded-lab.sh start     # arranca en orden
@@ -16,25 +16,27 @@
 # Variables opcionales (se ponen antes del comando):
 #   EDITION=community|enterprise  edición (auto: la que ya esté instalada;
 #                                 si no hay ninguna, community)
-#   MONGO_VERSION=9.0.4  fija una versión 9.0.x concreta (si no, la más nueva)
+#   MONGO_VERSION=8.3.17 fija una versión 8.3.x concreta (si no, la más nueva)
 #   MEMBERS=1|3          miembros por replica set (auto: 3 si hay >=15 GB RAM)
 #   CACHE_GB=0.5         cache WiredTiger por mongod
 #   SAMPLE_DATA=0        no cargar la colección de prueba labdb.clientes
-#   UPGRADE_FCV=0        en "upgrade", dejar el FCV anterior (no activar 9.0)
+#   UPGRADE_FCV=0        en "upgrade", dejar el FCV anterior (no activar 8.3)
 #   ADMIN_PWD=...        password de clusterAdmin (si no, se pregunta)
 #   SHARD_ADMIN_PWD=...  password de shardAdmin (si no, se pregunta)
 # Ejemplo: sudo EDITION=enterprise MEMBERS=1 bash setup-sharded-lab.sh
 # =============================================================================
 set -euo pipefail
 
-TARGET_SERIES=9.0
+TARGET_SERIES=8.3
+MIN_PATCH=16          # 8.3.16+ recomendado (fallos con kernels Linux recientes)
 CONF_DIR=/etc/mongodb-lab
 DATA_DIR=/data/mongo
 LOG_DIR=/var/log/mongodb
 UNIT_DIR=/etc/systemd/system
 KEYFILE=$CONF_DIR/keyfile
 STATE=$CONF_DIR/lab.env
-KEYRING=/usr/share/keyrings/mongodb-server-9.gpg
+KEYRING=/usr/share/keyrings/mongodb-server-8.0.gpg   # 8.3 usa la llave de 8.0
+KEY_URL=https://pgp.mongodb.com/server-8.0.asc
 MONGOS_PORT=27017
 ADMIN_USER=clusterAdmin
 SHARD_ADMIN_USER=shardAdmin
@@ -120,7 +122,7 @@ show_fcv() { # el FCV se lee en el config server (el mongos no lo reporta)
 }
 
 # ------------------------------------------------------- versión y paquetes
-installed_version() { # v9.0.4, o vacío si no hay mongod
+installed_version() { # p. ej. v8.3.17, o vacío si no hay mongod
   if command -v mongod >/dev/null 2>&1; then
     mongod --version 2>/dev/null | awk '/db version/ {print $3; exit}'
   fi
@@ -147,51 +149,72 @@ packages() { # paquetes de la edición, con versión si MONGO_VERSION está defi
   echo mongodb-mongosh
 }
 
-check_os() { # define DISTRO, CODE, COMP, ARCHS; se detiene si 9.0 no tiene paquetes aquí
+check_os() { # define DISTRO, CODE, COMP, ARCHS; se detiene si 8.3 no tiene paquetes aquí
   . /etc/os-release
   local os=${ID:-} arch
   CODE=${VERSION_CODENAME:-}
   arch=$(dpkg --print-architecture)
   case "$os/$CODE" in
-    ubuntu/noble|ubuntu/jammy|ubuntu/resolute)
-      DISTRO=ubuntu; COMP=multiverse; ARCHS=amd64,arm64
-      [[ $arch == amd64 || $arch == arm64 ]] || die "Arquitectura no soportada: $arch" ;;
-    debian/trixie)
+    debian/bookworm)
       DISTRO=debian; COMP=main; ARCHS=amd64
       [[ $arch == amd64 ]] || die "MongoDB $TARGET_SERIES en Debian solo tiene paquetes para x86_64 (amd64); detectado: $arch" ;;
-    debian/bookworm)
-      die "MongoDB $TARGET_SERIES no tiene paquetes para Debian 12 (bookworm); en Debian solo soporta Debian 13 (trixie).
-        Opciones: 1) actualizar este servidor a Debian 13,  2) usar Ubuntu 24.04,
-        3) quedarte en Debian 12 con MongoDB 8.0. No se cambió nada en el sistema." ;;
+    ubuntu/noble|ubuntu/jammy|ubuntu/focal)
+      DISTRO=ubuntu; COMP=multiverse; ARCHS=amd64,arm64
+      [[ $arch == amd64 || $arch == arm64 ]] || die "Arquitectura no soportada: $arch" ;;
     *)
-      die "MongoDB $TARGET_SERIES se instala aquí solo en Ubuntu 24.04/22.04/26.04 o Debian 13 (detectado: ${PRETTY_NAME:-desconocido})." ;;
+      die "MongoDB $TARGET_SERIES se instala aquí solo en Debian 12 o Ubuntu 24.04/22.04/20.04 (detectado: ${PRETTY_NAME:-desconocido}). No se cambió nada en el sistema." ;;
   esac
   info "Sistema: ${PRETTY_NAME:-desconocido} ($arch) -> repositorio $DISTRO $CODE"
 }
 
+repo_line() { # repo_line host path serie
+  echo "deb [ arch=$ARCHS signed-by=$KEYRING ] https://$1/apt/$DISTRO $CODE/$2/$3 $COMP"
+}
+
+latest_available() { # versión 8.3.x más nueva que ofrece apt para el servidor
+  apt-cache madison "$1" 2>/dev/null | awk '{print $3}' | grep -E "^${TARGET_SERIES//./\\.}\.[0-9]+$" | sort -V | tail -n 1 || true
+}
+
 install_packages() {
   check_os
-  local host path list f
+  local host path list f p avail series
   if [[ $EDITION == enterprise ]]; then host=repo.mongodb.com; path=mongodb-enterprise
   else host=repo.mongodb.org; path=mongodb-org; fi
+  p=$path-server
   list=/etc/apt/sources.list.d/$path-$TARGET_SERIES.list
 
   log "Configurando el repositorio oficial de MongoDB $EDITION $TARGET_SERIES ($DISTRO $CODE)"
-  for f in /etc/apt/sources.list.d/mongodb-org-*.list /etc/apt/sources.list.d/mongodb-enterprise-*.list; do
+  for f in /etc/apt/sources.list.d/mongodb-org*.list /etc/apt/sources.list.d/mongodb-enterprise*.list \
+           /etc/apt/sources.list.d/mongodb-org*.sources /etc/apt/sources.list.d/mongodb-enterprise*.sources; do
     [[ -e $f && $f != "$list" ]] || continue
     mv "$f" "$f.disabled"; info "repositorio anterior desactivado: $f"
   done
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg curl ca-certificates
-  curl -fsSL https://pgp.mongodb.com/server-9.asc | gpg --dearmor --yes -o "$KEYRING"
-  echo "deb [ arch=$ARCHS signed-by=$KEYRING ] https://$host/apt/$DISTRO $CODE/$path/$TARGET_SERIES $COMP" > "$list"
-  apt-get update -qq
+  curl -fsSL "$KEY_URL" | gpg --dearmor --yes -o "$KEYRING"
 
-  log "Instalando paquetes de MongoDB $EDITION ${MONGO_VERSION:-$TARGET_SERIES (última)}"
+  # La guía de Debian 12 apunta a la ruta /8.0; la de Ubuntu a /8.3. Se prueba /8.3
+  # primero y, si no ofrece paquetes 8.3.x, la ruta /8.0.
+  for series in "$TARGET_SERIES" 8.0; do
+    repo_line "$host" "$path" "$series" > "$list"
+    apt-get update -qq || true
+    avail=$(latest_available "$p")
+    if [[ -n $avail ]]; then info "repositorio: $(cat "$list")"; break; fi
+    info "la ruta $CODE/$path/$series no ofrece $p $TARGET_SERIES.x"
+  done
+  [[ -n $avail ]] || { rm -f "$list"; die "Ningún repositorio ofrece $p $TARGET_SERIES.x para $DISTRO $CODE. Revisa: apt-cache madison $p"; }
+
+  MONGO_VERSION=${MONGO_VERSION:-$avail}
+  [[ $(major_minor "v$MONGO_VERSION") == "$TARGET_SERIES" ]] || die "MONGO_VERSION=$MONGO_VERSION no es de la serie $TARGET_SERIES."
+  log "Instalando paquetes de MongoDB $EDITION $MONGO_VERSION (todos los componentes con la misma versión)"
   # shellcheck disable=SC2046
   apt-mark unhold $(packages | sed 's/=.*//') >/dev/null 2>&1 || true
   # shellcheck disable=SC2046
   DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages --allow-downgrades $(packages)
+  # Fija la versión para que un "apt upgrade" no la cambie sin querer
+  # shellcheck disable=SC2046
+  apt-mark hold $(packages | sed 's/=.*//') >/dev/null
+  info "paquetes fijados (apt-mark hold)"
 }
 
 check_version() {
@@ -199,6 +222,10 @@ check_version() {
   [[ $(major_minor "$ver") == "$TARGET_SERIES" ]] || die "Tras instalar se esperaba la serie $TARGET_SERIES y se encontró ${ver:-nada}."
   command -v mongos >/dev/null && command -v mongosh >/dev/null || die "Faltan mongos o mongosh tras la instalación."
   info "mongod $ver · mongosh $(mongosh --version)"
+  local patch=${ver##*.}
+  if [[ $patch =~ ^[0-9]+$ ]] && (( patch < MIN_PATCH )); then
+    warn "Se recomienda $TARGET_SERIES.$MIN_PATCH o posterior: algunas versiones $TARGET_SERIES.x anteriores no arrancan con kernels Linux recientes."
+  fi
 }
 
 # ------------------------------------------------------------------- pasos
@@ -237,9 +264,12 @@ install_mongodb() {
     log "MongoDB $EDITION $ver ya instalado"
     return
   fi
+  if [[ $(major_minor "$ver") == 9.* ]]; then
+    die "Ya está instalado MongoDB $ver, más nuevo que $TARGET_SERIES. Este script no hace downgrade."
+  fi
   if [[ -n $ver ]]; then
     log "Se encontró MongoDB $ver ($EDITION); se actualizarán los paquetes a $TARGET_SERIES"
-    warn "El servicio mongod por defecto (/var/lib/mongodb) no se usa en este laboratorio y queda desactivado. Si tiene datos de otra versión, súbelo con la guía oficial antes de volver a usarlo."
+    warn "El servicio mongod por defecto (/var/lib/mongodb) no se usa en este laboratorio y queda desactivado."
   fi
   install_packages
   check_version
@@ -502,16 +532,17 @@ cmd_setup() {
   summary
 }
 
-cmd_upgrade() { # 8.0 / 8.3 -> 9.0, siguiendo el orden de la guía oficial
+cmd_upgrade() { # 8.0 / 8.2 -> 8.3, siguiendo el orden de la guía oficial
   need_root upgrade; load_state
   detect_edition
   local ver mm; ver=$(installed_version); mm=$(major_minor "$ver")
   log "Actualizar el laboratorio a MongoDB $TARGET_SERIES (instalado: ${ver:-ninguno}, edición: $EDITION)"
   case $mm in
     "$TARGET_SERIES") info "Los binarios ya son $TARGET_SERIES; solo se revisa el FCV." ;;
-    8.0|8.3) ;;
-    8.1|8.2) die "A $TARGET_SERIES no se sube desde $mm: primero hay que pasar por 8.3 (binarios y FCV 8.3) y luego a $TARGET_SERIES. En un laboratorio es más rápido recrearlo: sudo bash $0 reset && sudo bash $0" ;;
-    *) die "A $TARGET_SERIES solo se sube desde 8.0 u 8.3 (tienes ${ver:-nada}). Sube primero a 8.0, o recrea el laboratorio: sudo bash $0 reset && sudo bash $0" ;;
+    8.0|8.2) ;;
+    8.1) die "A $TARGET_SERIES no se sube desde 8.1: primero pasa a 8.2 (binarios y FCV 8.2). En un laboratorio es más rápido recrearlo: sudo bash $0 reset && sudo bash $0" ;;
+    9.*) die "Tienes ${ver}, que es más nueva que $TARGET_SERIES. Este script no hace downgrade." ;;
+    *) die "A $TARGET_SERIES solo se sube desde 8.0 u 8.2 (tienes ${ver:-nada}). Sube primero a 8.0, o recrea el laboratorio: sudo bash $0 reset && sudo bash $0" ;;
   esac
 
   [[ $mm == "$TARGET_SERIES" ]] || check_os   # antes de tocar FCV, balancer o servicios
@@ -526,7 +557,7 @@ cmd_upgrade() { # 8.0 / 8.3 -> 9.0, siguiendo el orden de la guía oficial
     const d = db.getSiblingDB('config').shards.find({ draining: true }, { _id: 1 }).toArray().map(x => x._id);
     if (d.length) { print('    shards en drenado: ' + d.join(', ')); quit(2); }
     print('    ninguno');" \
-    || die "Hay un shard en proceso de eliminación. Termínalo antes de actualizar (en 8.0: db.adminCommand({ removeShard: '<shard>' }) hasta state: 'completed')."
+    || die "Hay un shard en proceso de eliminación. Termínalo antes de actualizar (en 8.0/8.2: db.adminCommand({ removeShard: '<shard>' }) hasta state: 'completed')."
 
   if [[ $mm != "$TARGET_SERIES" ]]; then
     log "Requisito: FCV $mm en todo el clúster"
@@ -544,7 +575,7 @@ cmd_upgrade() { # 8.0 / 8.3 -> 9.0, siguiendo el orden de la guía oficial
 
   if [[ ${UPGRADE_FCV:-1} == 1 ]]; then
     log "Activando las funciones de $TARGET_SERIES (FCV $TARGET_SERIES)"
-    info "Puede tardar: MongoDB pasa metadatos del config server a los shards."
+    info "Mientras corre, las migraciones, splits y merges de chunks pueden fallar con ConflictingOperationInProgress."
     mongos_js "db.adminCommand({ setFeatureCompatibilityVersion: '$TARGET_SERIES', confirm: true }); print('    FCV fijado en $TARGET_SERIES');" \
       || die "Falló setFeatureCompatibilityVersion $TARGET_SERIES (revisa $LOG_DIR/mongos.log)."
   else
